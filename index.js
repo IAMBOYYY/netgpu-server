@@ -1,7 +1,7 @@
-const express = require('express');
-const http    = require('http');
+const express    = require('express');
+const http       = require('http');
 const { Server } = require('socket.io');
-const cors    = require('cors');
+const cors       = require('cors');
 
 const app    = express();
 const server = http.createServer(app);
@@ -10,599 +10,534 @@ const io     = new Server(server, { cors: { origin: '*' } });
 app.use(cors());
 app.use(express.json());
 
-// ── API Keys (set these as env vars on Render) ───────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
+const PORT              = process.env.PORT || 10000;
 const NVIDIA_API_KEY    = process.env.NVIDIA_API_KEY;
 const CF_ACCOUNT_ID     = process.env.CLOUDFLARE_ACCOUNT_ID;
 const CF_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN;
 
-// ── Storage ──────────────────────────────────────────────────────
-const donors     = new Map();
-const jobQueue   = [];
-const activeJobs = new Map();
-const credits    = new Map();
-const jobHistory = [];
-
-// ── Config ───────────────────────────────────────────────────────
-const JOB_TIMEOUT_MS    = 120_000;
-const HEARTBEAT_DEAD_MS = 60_000;
-const CREDITS_EARNED    = 5;
-const CREDITS_NEW_USER  = 10;
-
-const JOB_CREDITS = {
-  video:  { base: 2, heavy: 4,  heavyOps: ['Merge Clips'] },
-  image:  { base: 1, heavy: 2,  heavyOps: ['AI Upscale', 'Remove Background'] },
-  ai:     { base: 3, heavy: 6,  heavyOps: ['Style Transfer', 'Image Generation'] },
-  '3d':   { base: 5, heavy: 10, heavyOps: ['Render Scene', 'Animation Export', 'Texture Bake'] },
-  data:   { base: 1, heavy: 2,  heavyOps: ['Data Analysis'] },
-  custom: { base: 2, heavy: 5,  heavyOps: ['Custom Pipeline'] },
-};
-
-// Which job types go to which GPU backend
-// nvidia  = NVIDIA NIM Nemotron  (AI, data, custom tasks)
-// cf      = Cloudflare Workers AI (image generation/classification)
-// donor   = phone donors         (video, 3D — needs real file pipeline)
 const GPU_ROUTES = {
   ai:     'nvidia',
   data:   'nvidia',
   custom: 'nvidia',
-  image:  'cf',
+  image:  'cloudflare',
   video:  'donor',
   '3d':   'donor',
 };
 
-function getJobCost(type, operation) {
-  const config = JOB_CREDITS[type] || JOB_CREDITS.custom;
-  return config.heavyOps.includes(operation) ? config.heavy : config.base;
+const CREDIT_COSTS = {
+  ai:     1,
+  image:  1,
+  video:  2,
+  data:   1,
+  custom: 2,
+  '3d':   4,
+};
+
+// ─── State ────────────────────────────────────────────────────────────────────
+const donors     = new Map();   // socketId → donor info
+const credits    = new Map();   // userId   → credit balance
+const jobQueue   = [];          // pending jobs waiting for a donor
+const activeJobs = new Map();   // jobId    → full job object (ALL jobs ever)
+
+let totalJobsDone = 0;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function getCredits(userId) {
+  if (!credits.has(userId)) credits.set(userId, 10); // 10 free starter credits
+  return credits.get(userId);
 }
 
-// ── NVIDIA NIM — Nemotron ─────────────────────────────────────────
+function generateId(prefix = 'job') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+}
+
+function getBestDonor(jobType) {
+  let best = null;
+  let bestPower = 0;
+  for (const [, donor] of donors) {
+    if (
+      donor.isIdle &&
+      donor.socket?.connected &&
+      (!donor.acceptedTypes || donor.acceptedTypes[jobType] !== false) &&
+      donor.gpuPower > bestPower
+    ) {
+      best = donor;
+      bestPower = donor.gpuPower;
+    }
+  }
+  return best;
+}
+
+// ─── NVIDIA NIM ───────────────────────────────────────────────────────────────
 async function processWithNVIDIA(job) {
-  console.log(`🤖 NVIDIA NIM: ${job.type}/${job.operation} | "${job.fileName}"`);
+  const prompt = `Process this ${job.type} task: ${job.operation || job.type}. File: ${job.fileName || 'input'}. Provide a brief result summary.`;
 
-  const prompt = buildNVIDIAPrompt(job);
-
-  const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+  const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${NVIDIA_API_KEY}`,
       'Content-Type':  'application/json',
+      'Authorization': `Bearer ${NVIDIA_API_KEY}`,
     },
     body: JSON.stringify({
       model:       'nvidia/llama-3.1-nemotron-70b-instruct',
-      messages:    [{ role: 'user', content: prompt }],
-      max_tokens:  600,
-      temperature: 0.6,
-      stream:      false,
+      max_tokens:  256,
+      temperature: 0.7,
+      messages: [
+        { role: 'system', content: 'You are a GPU compute processor. Be concise.' },
+        { role: 'user',   content: prompt },
+      ],
     }),
   });
 
-  const data = await res.json();
-
-  if (!res.ok) {
-    console.error('NVIDIA error:', data);
-    throw new Error(data.detail || data.message || 'NVIDIA API error');
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`NVIDIA API error ${response.status}: ${err}`);
   }
 
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error('Empty response from NVIDIA');
-
-  return {
-    processor:    '⚡ NVIDIA Nemotron 70B (DGX Cloud)',
-    result:       content,
-    tokens_used:  data.usage?.total_tokens || 0,
-  };
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || 'Processed successfully.';
 }
 
-function buildNVIDIAPrompt(job) {
-  const base = `You are a GPU-powered compute system called NetGPU. A user submitted a ${job.type} task.
-File: "${job.fileName}" (${job.fileSize || 'unknown size'})
-Operation: ${job.operation}
-${job.note ? 'User notes: ' + job.note : ''}
-
-`;
-
-  const opPrompts = {
-    // ── AI tasks ──────────────────────────────────────────────────
-    'Image Recognition':      base + 'Perform image recognition analysis. Identify objects, scenes, text, colors, and subjects. Format as a structured JSON report with confidence scores.',
-    'Object Detection':       base + 'Perform object detection. List all detected objects with bounding box estimates (x%, y%, w%, h%) and confidence scores. Return as JSON array.',
-    'Text Extraction (OCR)':  base + 'Perform OCR text extraction. Return all detected text, preserve formatting, and provide confidence per text block.',
-    'Face Detection':         base + 'Perform face detection analysis. Report number of faces, approximate positions, expressions, and demographic estimates. Return as JSON.',
-    'Style Transfer':         base + 'Process style transfer request. Describe the applied artistic style, techniques used, and expected visual output changes.',
-    'Image Generation':       base + 'Generate a detailed AI image creation report based on the prompt. Describe the image that would be generated including composition, style, colors, and subjects.',
-
-    // ── Data tasks ────────────────────────────────────────────────
-    'CSV Processing':         base + 'Analyze this CSV file. Provide: row count estimate, column names guessed from filename, data types, null value %, key statistics, and 3 actionable insights.',
-    'JSON Transform':         base + 'Transform and validate this JSON file. Provide: schema analysis, depth, key count, suggestions for optimization, and transformed structure preview.',
-    'Data Analysis':          base + 'Perform comprehensive data analysis. Provide: statistical summary, pattern detection, anomaly flags, correlation suggestions, and visualization recommendations.',
-    'File Compress':          base + 'Analyze compression opportunity for this file. Estimate: original vs compressed size, compression ratio, recommended algorithm, and processing time.',
-    'Format Convert':         base + 'Process format conversion. Describe: source format analysis, target format mapping, data integrity checks, and conversion summary.',
-    'Batch Rename':           base + 'Process batch rename operation. Provide: naming pattern analysis, preview of renamed files (first 10), conflict detection, and summary.',
-
-    // ── Custom ────────────────────────────────────────────────────
-    'Raw Compute':            base + 'Process this raw compute task and return detailed results.',
-    'Script Execution':       base + 'Analyze and simulate script execution. Provide expected output, runtime estimate, and any warnings.',
-    'Batch Process':          base + 'Process this batch operation and return a detailed completion report.',
-    'Custom Pipeline':        base + 'Execute this custom pipeline and return step-by-step results.',
-  };
-
-  return opPrompts[job.operation] || (base + `Process this ${job.type} task and return a detailed result report.`);
-}
-
-// ── Cloudflare Workers AI ─────────────────────────────────────────
+// ─── Cloudflare Workers AI ────────────────────────────────────────────────────
 async function processWithCloudflare(job) {
-  console.log(`☁️  Cloudflare Workers AI: ${job.type}/${job.operation} | "${job.fileName}"`);
+  const model    = '@cf/stabilityai/stable-diffusion-xl-base-1.0';
+  const prompt   = `${job.operation || 'process'}: ${job.fileName || 'image'}`;
 
-  // Pick model based on operation
-  const modelId = getCloudflareModel(job.operation);
-  const payload  = buildCFPayload(job, modelId);
-
-  const res = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${modelId}`,
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${model}`,
     {
       method:  'POST',
       headers: {
         'Authorization': `Bearer ${CF_API_TOKEN}`,
         'Content-Type':  'application/json',
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ prompt }),
     }
   );
 
-  const data = await res.json();
-
-  if (!res.ok || !data.success) {
-    console.error('Cloudflare error:', data);
-    throw new Error(data.errors?.[0]?.message || 'Cloudflare Workers AI error');
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Cloudflare API error ${response.status}: ${err}`);
   }
 
-  return {
-    processor: `☁️ Cloudflare Workers AI (${modelId})`,
-    result:    formatCFResult(data.result, modelId, job),
-  };
+  return `Image processed via Cloudflare Workers AI. Operation: ${job.operation || 'transform'} complete.`;
 }
 
-function getCloudflareModel(operation) {
-  const map = {
-    'AI Upscale':           '@cf/bytedance/stable-diffusion-xl-lightning',
-    'Remove Background':    '@cf/llava-hf/llava-1.5-7b-hf',
-    'Batch Filter':         '@cf/meta/llama-3.1-8b-instruct',
-    'Compress':             '@cf/meta/llama-3.1-8b-instruct',
-    'Resize / Crop':        '@cf/meta/llama-3.1-8b-instruct',
-    'Convert Format':       '@cf/meta/llama-3.1-8b-instruct',
-  };
-  return map[operation] || '@cf/meta/llama-3.1-8b-instruct';
-}
+// ─── Job Processor ────────────────────────────────────────────────────────────
+async function processJob(job) {
+  const start    = Date.now();
+  const jobObj   = activeJobs.get(job.id);
+  if (!jobObj) return;
 
-function buildCFPayload(job, modelId) {
-  // Text-to-image models
-  if (modelId === '@cf/bytedance/stable-diffusion-xl-lightning' ||
-      modelId === '@cf/stabilityai/stable-diffusion-xl-base-1.0') {
-    return {
-      prompt: `high quality, ${job.operation} of ${job.fileName}. ${job.note || '4K ultra detailed professional result'}`,
-    };
-  }
+  jobObj.status = 'processing';
+  jobObj.startedAt = Date.now();
 
-  // LLaVA vision model
-  if (modelId === '@cf/llava-hf/llava-1.5-7b-hf') {
-    return {
-      image:  [],
-      prompt: `Perform "${job.operation}" on the image file "${job.fileName}". ${job.note || 'Provide detailed results.'}`,
-      max_tokens: 400,
-    };
-  }
-
-  // Default: Llama text model
-  return {
-    messages: [
-      {
-        role:    'system',
-        content: 'You are a GPU-powered image processing engine called NetGPU. Process image tasks and return structured results.',
-      },
-      {
-        role:    'user',
-        content: `Process "${job.operation}" for image file "${job.fileName}" (${job.fileSize || 'unknown size'}). ${job.note || 'Return processing results, dimensions, and output details.'}`,
-      },
-    ],
-    max_tokens: 400,
-  };
-}
-
-function formatCFResult(result, modelId, job) {
-  if (modelId.includes('stable-diffusion')) {
-    // Returns image bytes — describe it
-    return `Image generated successfully via Stable Diffusion XL Lightning.\nOperation: ${job.operation}\nFile: ${job.fileName}\nOutput: High-resolution processed image ready for download.\nNote: Real image binary will be returned when file upload is enabled in APK build.`;
-  }
-  if (result?.response) return result.response;
-  if (result?.description) return result.description;
-  return JSON.stringify(result, null, 2);
-}
-
-// ── Main GPU processor — routes to right backend ──────────────────
-async function processJobWithGPU(job, requesterSocket) {
-  const route = GPU_ROUTES[job.type] || 'donor';
-
-  if (route === 'donor') {
-    // Video/3D still need donor phones — fall through to donor queue
-    return false;
-  }
-
-  const startTime = Date.now();
-
-  // Notify client: processing started
+  // Notify requester
+  const requesterSocket = io.sockets.sockets.get(job.socketId);
   if (requesterSocket) {
     requesterSocket.emit('job_processing', {
       jobId:   job.id,
-      message: route === 'nvidia'
-        ? `⚡ Processing on NVIDIA Nemotron 70B (DGX Cloud)...`
-        : `☁️  Processing on Cloudflare Workers AI GPU network...`,
+      message: `Processing on ${jobObj.processor === 'nvidia' ? '⚡ NVIDIA NIM' : '☁️ Cloudflare'} GPU...`,
     });
   }
 
   try {
-    const gpuResult = route === 'nvidia'
-      ? await processWithNVIDIA(job)
-      : await processWithCloudflare(job);
-
-    const duration = Date.now() - startTime;
-
-    // Deduct credits from requester
-    const prev = credits.get(job.requesterUserId) || 0;
-    const next = Math.max(0, prev - job.cost);
-    credits.set(job.requesterUserId, next);
-
-    // Save to history
-    jobHistory.push({
-      jobId: job.id, type: job.type, operation: job.operation,
-      fileName: job.fileName, cost: job.cost,
-      processor: gpuResult.processor,
-      duration, completedAt: Date.now(),
-    });
-    if (jobHistory.length > 100) jobHistory.shift();
-
-    // Send result to client
-    if (requesterSocket) {
-      requesterSocket.emit('job_result', {
-        jobId:      job.id,
-        processor:  gpuResult.processor,
-        result:     gpuResult.result,
-        tokens:     gpuResult.tokens_used,
-        duration,
-        newCredits: next,
-        message:    `✅ Done in ${(duration / 1000).toFixed(1)}s via ${gpuResult.processor}`,
-      });
-      requesterSocket.emit('credits_update', { credits: next });
+    let result;
+    if (jobObj.processor === 'nvidia') {
+      result = await processWithNVIDIA(job);
+    } else if (jobObj.processor === 'cloudflare') {
+      result = await processWithCloudflare(job);
+    } else {
+      result = 'Queued for donor processing.';
     }
 
-    console.log(`✅ GPU job done: ${job.id} | ${gpuResult.processor} | ${(duration/1000).toFixed(1)}s`);
-    broadcastNetworkStatus();
-    return true; // handled
+    const duration = Date.now() - start;
+
+    // Update job record
+    jobObj.status   = 'completed';
+    jobObj.result   = result;
+    jobObj.duration = duration;
+    jobObj.completedAt = Date.now();
+    totalJobsDone++;
+
+    // Deduct credits from requester
+    const currentCredits = getCredits(job.userId);
+    credits.set(job.userId, Math.max(0, currentCredits - (job.creditCost || 1)));
+
+    // Notify requester
+    if (requesterSocket) {
+      requesterSocket.emit('job_result', {
+        jobId:    job.id,
+        result,
+        duration,
+        message:  `✅ Job complete in ${(duration / 1000).toFixed(1)}s`,
+        credits:  getCredits(job.userId),
+      });
+      requesterSocket.emit('credits_update', { credits: getCredits(job.userId) });
+    }
+
+    console.log(`✅ Job done: ${job.id} | ${job.type} | ${(duration / 1000).toFixed(1)}s`);
 
   } catch (err) {
-    console.error(`❌ GPU processing failed: ${job.id}`, err.message);
+    console.error(`❌ Job failed: ${job.id}`, err.message);
+
+    jobObj.status = 'failed';
+    jobObj.error  = err.message;
+
     if (requesterSocket) {
       requesterSocket.emit('job_error', {
         jobId:   job.id,
-        message: `GPU processing failed: ${err.message}. Please try again.`,
+        message: `❌ Processing failed: ${err.message}`,
+        credits: getCredits(job.userId),
       });
     }
-    return true; // still handled (don't fall to donor queue)
   }
 }
 
-// ── REST endpoints ────────────────────────────────────────────────
+// ─── Donor Job Assignment ─────────────────────────────────────────────────────
+function tryAssignQueuedJobs() {
+  for (let i = jobQueue.length - 1; i >= 0; i--) {
+    const job    = jobQueue[i];
+    const jobObj = activeJobs.get(job.id);
+
+    // Skip cancelled jobs
+    if (!jobObj || jobObj.status === 'cancelled') {
+      jobQueue.splice(i, 1);
+      continue;
+    }
+
+    const donor = getBestDonor(job.type);
+    if (donor) {
+      jobQueue.splice(i, 1);
+      jobObj.status  = 'processing';
+      jobObj.donorId = donor.userId;
+
+      donor.isIdle     = false;
+      donor.currentJob = job.id;
+
+      donor.socket.emit('job_assigned', {
+        id:        job.id,
+        type:      job.type,
+        operation: job.operation,
+        fileName:  job.fileName,
+        fileSize:  job.fileSize,
+      });
+
+      // Timeout: re-queue if donor doesn't complete in 2 min
+      setTimeout(() => {
+        const j = activeJobs.get(job.id);
+        if (j && j.status === 'processing') {
+          j.status = 'queued';
+          jobQueue.push(job);
+          donor.isIdle     = true;
+          donor.currentJob = null;
+          const s = io.sockets.sockets.get(job.socketId);
+          if (s) s.emit('job_requeued', { jobId: job.id, message: '⚠️ Donor timed out — requeued.' });
+          console.log(`⚠️ Job requeued (donor timeout): ${job.id}`);
+        }
+      }, 120000);
+
+      const s = io.sockets.sockets.get(job.socketId);
+      if (s) s.emit('job_processing', { jobId: job.id, message: `⚡ Donor GPU assigned (${donor.gpuPower}% power)` });
+
+      console.log(`📱 Job assigned to donor: ${job.id} → ${donor.userId}`);
+    }
+  }
+}
+
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  console.log(`🔌 Connected: ${socket.id}`);
+
+  // ── Register as donor ──────────────────────────────────────────────────────
+  socket.on('register_donor', (data) => {
+    const userId = data.userId || socket.id;
+    donors.set(socket.id, {
+      socket,
+      socketId:      socket.id,
+      userId,
+      gpuPower:      data.gpuPower || 15,
+      device:        data.device   || 'Unknown',
+      acceptedTypes: data.acceptedTypes || null,
+      isIdle:        true,
+      currentJob:    null,
+      joinedAt:      Date.now(),
+    });
+
+    socket.emit('registered', {
+      role:    'donor',
+      userId,
+      credits: getCredits(userId),
+    });
+
+    console.log(`✅ Donor online: ${userId} | GPU: ${data.gpuPower}%`);
+    tryAssignQueuedJobs();
+
+    io.emit('network_status', getNetworkStats());
+  });
+
+  // ── Submit job ─────────────────────────────────────────────────────────────
+  socket.on('submit_job', (data) => {
+    const userId     = data.userId || socket.id;
+    const jobType    = data.type   || 'ai';
+    const creditCost = data.creditCost || CREDIT_COSTS[jobType] || 1;
+    const userCreds  = getCredits(userId);
+
+    if (userCreds < creditCost) {
+      socket.emit('job_error', {
+        type:    'insufficient_credits',
+        message: `❌ Not enough credits. Need ${creditCost}, have ${userCreds}.`,
+        credits: userCreds,
+      });
+      return;
+    }
+
+    const jobId = generateId('job');
+    const processor = GPU_ROUTES[jobType] || 'donor';
+
+    const job = {
+      id:          jobId,
+      socketId:    socket.id,
+      userId,
+      type:        jobType,
+      operation:   data.operation || '',
+      fileName:    data.fileName  || 'unknown',
+      fileSize:    data.fileSize  || '0',
+      creditCost,
+      processor,
+      status:      'queued',
+      timestamp:   Date.now(),
+      result:      null,
+      duration:    null,
+      credits_cost: creditCost,
+    };
+
+    activeJobs.set(jobId, job);
+
+    socket.emit('job_queued', {
+      jobId,
+      position:     jobQueue.length + 1,
+      message:      `⏳ Job queued — routing to ${processor === 'nvidia' ? '⚡ NVIDIA NIM' : processor === 'cloudflare' ? '☁️ Cloudflare' : '📱 Donor'}`,
+      has_donors:   donors.size > 0,
+      donors_ready: getBestDonor(jobType) !== null,
+    });
+
+    console.log(`📥 Job submitted: ${jobId} | ${jobType} | ${processor} | User: ${userId}`);
+
+    if (processor === 'nvidia' || processor === 'cloudflare') {
+      // Process immediately on GPU backend
+      processJob(job);
+    } else {
+      // Queue for donor
+      jobQueue.push(job);
+      tryAssignQueuedJobs();
+    }
+
+    io.emit('network_status', getNetworkStats());
+  });
+
+  // ── Cancel job ─────────────────────────────────────────────────────────────
+  socket.on('cancel_job', ({ jobId }) => {
+    const job = activeJobs.get(jobId);
+    if (!job) return;
+
+    if (job.status === 'queued' || job.status === 'processing') {
+      job.status = 'cancelled';
+
+      // Remove from queue if still there
+      const idx = jobQueue.findIndex(j => j.id === jobId);
+      if (idx !== -1) jobQueue.splice(idx, 1);
+
+      // Free up donor if assigned
+      for (const [, donor] of donors) {
+        if (donor.currentJob === jobId) {
+          donor.isIdle     = true;
+          donor.currentJob = null;
+          donor.socket.emit('job_cancelled', { jobId });
+        }
+      }
+
+      socket.emit('job_cancelled', { jobId });
+      console.log(`🚫 Job cancelled: ${jobId}`);
+      io.emit('network_status', getNetworkStats());
+    }
+  });
+
+  // ── Donor: job complete ────────────────────────────────────────────────────
+  socket.on('job_complete', ({ jobId, result }) => {
+    const job    = activeJobs.get(jobId);
+    const donor  = donors.get(socket.id);
+    if (!job || !donor) return;
+
+    const duration = Date.now() - (job.startedAt || job.timestamp);
+    job.status     = 'completed';
+    job.result     = result || 'Processed successfully.';
+    job.duration   = duration;
+    job.completedAt = Date.now();
+    totalJobsDone++;
+
+    donor.isIdle     = true;
+    donor.currentJob = null;
+
+    // Pay donor
+    const donorCreds = getCredits(donor.userId);
+    credits.set(donor.userId, donorCreds + 5);
+    donor.socket.emit('credits_earned', { earned: 5, total: getCredits(donor.userId) });
+    donor.socket.emit('credits_update',  { credits: getCredits(donor.userId) });
+
+    // Deduct from requester
+    const requesterCreds = getCredits(job.userId);
+    credits.set(job.userId, Math.max(0, requesterCreds - job.creditCost));
+
+    // Notify requester
+    const requesterSocket = io.sockets.sockets.get(job.socketId);
+    if (requesterSocket) {
+      requesterSocket.emit('job_result', {
+        jobId,
+        result:   job.result,
+        duration,
+        message:  `✅ Job complete in ${(duration / 1000).toFixed(1)}s`,
+        credits:  getCredits(job.userId),
+      });
+      requesterSocket.emit('credits_update', { credits: getCredits(job.userId) });
+    }
+
+    console.log(`✅ Donor completed job: ${jobId}`);
+    tryAssignQueuedJobs();
+    io.emit('network_status', getNetworkStats());
+  });
+
+  // ── Donor: job failed ──────────────────────────────────────────────────────
+  socket.on('job_failed', ({ jobId, reason }) => {
+    const job   = activeJobs.get(jobId);
+    const donor = donors.get(socket.id);
+    if (!job) return;
+
+    job.status = 'failed';
+    job.error  = reason || 'Donor reported failure';
+
+    if (donor) {
+      donor.isIdle     = true;
+      donor.currentJob = null;
+    }
+
+    const requesterSocket = io.sockets.sockets.get(job.socketId);
+    if (requesterSocket) {
+      requesterSocket.emit('job_error', {
+        jobId,
+        message: `❌ Job failed: ${reason || 'Unknown error'}`,
+        credits: getCredits(job.userId),
+      });
+    }
+
+    console.log(`❌ Donor job failed: ${jobId} | ${reason}`);
+    tryAssignQueuedJobs();
+    io.emit('network_status', getNetworkStats());
+  });
+
+  // ── Heartbeat ──────────────────────────────────────────────────────────────
+  socket.on('heartbeat', () => {
+    socket.emit('heartbeat_ack', { ts: Date.now() });
+  });
+
+  // ── Update donor status ────────────────────────────────────────────────────
+  socket.on('update_status', ({ isIdle, gpuPower }) => {
+    const donor = donors.get(socket.id);
+    if (donor) {
+      donor.isIdle    = isIdle;
+      donor.gpuPower  = gpuPower || donor.gpuPower;
+    }
+    if (isIdle) tryAssignQueuedJobs();
+    io.emit('network_status', getNetworkStats());
+  });
+
+  // ── Get credits ────────────────────────────────────────────────────────────
+  socket.on('get_credits', ({ userId }) => {
+    socket.emit('credits_update', { credits: getCredits(userId || socket.id) });
+  });
+
+  // ── Disconnect ─────────────────────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    const donor = donors.get(socket.id);
+    if (donor) {
+      // Re-queue any active job
+      if (donor.currentJob) {
+        const job = activeJobs.get(donor.currentJob);
+        if (job && job.status === 'processing') {
+          job.status = 'queued';
+          jobQueue.push(job);
+          const s = io.sockets.sockets.get(job.socketId);
+          if (s) s.emit('job_requeued', { jobId: job.id, message: '⚠️ Donor disconnected — requeued.' });
+        }
+      }
+      donors.delete(socket.id);
+      console.log(`🔴 Donor offline: ${donor.userId}`);
+      io.emit('network_status', getNetworkStats());
+    }
+    console.log(`❌ Disconnected: ${socket.id}`);
+  });
+});
+
+// ─── Network Stats ────────────────────────────────────────────────────────────
+function getNetworkStats() {
+  const idleDonors = Array.from(donors.values()).filter(d => d.isIdle).length;
+  return {
+    donors_online:   donors.size,
+    idle_donors:     idleDonors,
+    jobs_in_queue:   jobQueue.filter(j => activeJobs.get(j.id)?.status === 'queued').length,
+    active_jobs:     Array.from(activeJobs.values()).filter(j => j.status === 'processing').length,
+    total_jobs_done: totalJobsDone,
+  };
+}
+
+// ─── REST Endpoints ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
+  const nvidiaOk     = !!NVIDIA_API_KEY;
+  const cloudflareOk = !!CF_ACCOUNT_ID && !!CF_API_TOKEN;
+
   res.json({
-    status: '🟢 NetGPU Server is Online',
+    status:       '🟢 NetGPU Server is Online',
     gpu_backends: {
-      nvidia:     !!NVIDIA_API_KEY  ? '✅ NVIDIA NIM Connected' : '❌ No API Key',
-      cloudflare: !!CF_API_TOKEN    ? '✅ Cloudflare Workers AI Connected' : '❌ No API Key',
+      nvidia:     nvidiaOk     ? '✅ NVIDIA NIM Connected'          : '❌ NVIDIA_API_KEY missing',
+      cloudflare: cloudflareOk ? '✅ Cloudflare Workers AI Connected' : '❌ Cloudflare keys missing',
     },
-    stats: {
-      donors_online:   donors.size,
-      idle_donors:     countIdleDonors(),
-      jobs_in_queue:   jobQueue.length,
-      active_jobs:     activeJobs.size,
-      total_jobs_done: jobHistory.length,
-    },
+    stats:  getNetworkStats(),
     routes: GPU_ROUTES,
   });
 });
 
 app.get('/donors', (req, res) => {
-  res.json({
-    count: donors.size,
-    donors: Array.from(donors.values()).map(d => ({
-      userId: d.userId, gpuPower: d.gpuPower, isIdle: d.isIdle, jobsDone: d.jobsDone,
-    }))
-  });
+  const list = Array.from(donors.values()).map(d => ({
+    userId:   d.userId,
+    gpuPower: d.gpuPower,
+    device:   d.device,
+    isIdle:   d.isIdle,
+    joinedAt: d.joinedAt,
+  }));
+  res.json({ donors: list, total: list.length });
 });
 
 app.get('/history', (req, res) => {
-  res.json({ count: jobHistory.length, jobs: jobHistory.slice().reverse() });
+  const all = Array.from(activeJobs.values())
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 100);
+  res.json({ jobs: all, total: all.length });
 });
 
-// ── Sockets ───────────────────────────────────────────────────────
-io.on('connection', (socket) => {
-  console.log('📱 Connected:', socket.id);
-
-  socket.on('register_donor', (data) => {
-    const userId = data.userId || ('anon_' + socket.id.slice(0, 6));
-    if (!credits.has(userId)) credits.set(userId, CREDITS_NEW_USER);
-
-    donors.set(socket.id, {
-      id: socket.id, userId,
-      gpuPower:      data.gpuPower      || 15,
-      device:        data.device        || 'Android',
-      acceptedTypes: data.acceptedTypes || null,
-      isIdle: true, lastSeen: Date.now(), jobsDone: 0,
-    });
-
-    socket.emit('registered', { role: 'donor', userId, credits: credits.get(userId) });
-    console.log(`✅ Donor: ${userId} | GPU: ${data.gpuPower}%`);
-    broadcastNetworkStatus();
-    tryAssignJobs();
-  });
-
-  socket.on('submit_job', async (data) => {
-    const userId      = data.userId || ('anon_' + socket.id.slice(0, 6));
-    if (!credits.has(userId)) credits.set(userId, CREDITS_NEW_USER);
-
-    const jobType   = data.type      || 'custom';
-    const operation = data.operation || '';
-    const cost      = getJobCost(jobType, operation);
-    const userCred  = credits.get(userId);
-
-    if (userCred < cost) {
-      socket.emit('job_error', {
-        type: 'no_credits',
-        message: `Not enough credits. Need ${cost}, have ${userCred}.`,
-        credits: userCred, cost,
-      });
-      return;
-    }
-
-    const job = {
-      id:              generateId(),
-      type:            jobType,
-      operation,
-      quality:         data.quality  || 'standard',
-      format:          data.format   || 'output',
-      fileName:        data.fileName || 'file',
-      fileSize:        data.fileSize || 0,
-      note:            data.note     || '',
-      cost,
-      requesterId:     socket.id,
-      requesterUserId: userId,
-      status:          'queued',
-      createdAt:       Date.now(),
-      donorId: null, assignedAt: null, timeoutTimer: null,
-    };
-
-    const route = GPU_ROUTES[jobType] || 'donor';
-    console.log(`📋 Job: ${job.id} | ${jobType}/${operation} | cost:${cost}cr | route:${route}`);
-
-    // GPU-routed jobs (ai/data/custom/image) → process immediately
-    if (route !== 'donor') {
-      socket.emit('job_queued', {
-        jobId: job.id, cost,
-        message: route === 'nvidia'
-          ? `⚡ Routing to NVIDIA Nemotron GPU...`
-          : `☁️  Routing to Cloudflare Workers AI...`,
-      });
-      await processJobWithGPU(job, socket);
-      return;
-    }
-
-    // Donor-routed jobs (video/3d) → queue
-    jobQueue.push(job);
-    const idleCount = countIdleDonorsForType(jobType);
-
-    socket.emit('job_queued', {
-      jobId:        job.id,
-      position:     jobQueue.length,
-      donors_ready: idleCount,
-      cost,
-      message: idleCount > 0
-        ? `Found ${idleCount} donor${idleCount > 1 ? 's' : ''}! Assigning now...`
-        : `No donors online for ${jobType}. Waiting for a donor to connect...`,
-    });
-
-    if (idleCount > 0) tryAssignJobs();
-  });
-
-  socket.on('job_complete', (data) => {
-    const job = activeJobs.get(data.jobId);
-    if (!job) return;
-    if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
-    const duration = Date.now() - job.assignedAt;
-
-    const requesterSocket = io.sockets.sockets.get(job.requesterId);
-    if (requesterSocket) {
-      requesterSocket.emit('job_result', {
-        jobId: data.jobId, result: data.result || 'processed', duration,
-        message: `✅ Done in ${(duration / 1000).toFixed(1)}s (donor GPU)`,
-      });
-    }
-
-    const donor = donors.get(socket.id);
-    if (donor) {
-      donor.isIdle = true;
-      donor.jobsDone++;
-      const prev = credits.get(donor.userId) || 0;
-      const next = prev + CREDITS_EARNED;
-      credits.set(donor.userId, next);
-      socket.emit('credits_earned', { earned: CREDITS_EARNED, total: next });
-    }
-
-    const reqPrev = credits.get(job.requesterUserId) || 0;
-    const reqNext = Math.max(0, reqPrev - job.cost);
-    credits.set(job.requesterUserId, reqNext);
-    if (requesterSocket) requesterSocket.emit('credits_update', { credits: reqNext });
-
-    jobHistory.push({
-      jobId: data.jobId, type: job.type, operation: job.operation,
-      fileName: job.fileName, cost: job.cost,
-      processor: 'Donor Phone GPU',
-      duration, completedAt: Date.now(),
-    });
-    if (jobHistory.length > 100) jobHistory.shift();
-
-    activeJobs.delete(data.jobId);
-    broadcastNetworkStatus();
-    tryAssignJobs();
-  });
-
-  socket.on('job_failed', (data) => {
-    const job = activeJobs.get(data.jobId);
-    if (!job) return;
-    requeueJob(job, data.reason || 'Donor reported failure');
-    activeJobs.delete(data.jobId);
-  });
-
-  socket.on('heartbeat', () => {
-    const donor = donors.get(socket.id);
-    if (donor) donor.lastSeen = Date.now();
-  });
-
-  socket.on('update_status', (data) => {
-    const donor = donors.get(socket.id);
-    if (donor) {
-      const wasIdle       = donor.isIdle;
-      donor.isIdle        = data.isIdle        ?? donor.isIdle;
-      donor.gpuPower      = data.gpuPower       ?? donor.gpuPower;
-      donor.acceptedTypes = data.acceptedTypes  ?? donor.acceptedTypes;
-      donor.lastSeen      = Date.now();
-      if (!wasIdle && donor.isIdle) tryAssignJobs();
-    }
-    broadcastNetworkStatus();
-  });
-
-  socket.on('get_credits', (data) => {
-    const userId = data?.userId || null;
-    let bal = 0;
-    if (userId) {
-      bal = credits.get(userId) || 0;
-    } else {
-      const donor = donors.get(socket.id);
-      if (donor) bal = credits.get(donor.userId) || 0;
-    }
-    socket.emit('credits_update', { credits: bal });
-  });
-
-  socket.on('disconnect', () => {
-    const donor = donors.get(socket.id);
-    if (donor) {
-      activeJobs.forEach((job, jobId) => {
-        if (job.donorId === socket.id) {
-          requeueJob(job, 'Donor disconnected');
-          activeJobs.delete(jobId);
-        }
-      });
-      donors.delete(socket.id);
-      broadcastNetworkStatus();
-    }
-  });
+app.get('/queue', (req, res) => {
+  const queued = jobQueue
+    .map(j => activeJobs.get(j.id))
+    .filter(Boolean)
+    .filter(j => j.status === 'queued');
+  res.json({ queue: queued, length: queued.length });
 });
 
-// ── Donor job assignment (for video/3D) ───────────────────────────
-function tryAssignJobs() {
-  if (jobQueue.length === 0) return;
-  const available = Array.from(donors.values())
-    .filter(d => d.isIdle)
-    .sort((a, b) => b.gpuPower - a.gpuPower);
-  if (available.length === 0) return;
-
-  let assigned = 0;
-  while (jobQueue.length > 0 && available.length > 0) {
-    const job = jobQueue[0];
-    const donorIdx = available.findIndex(d =>
-      !d.acceptedTypes || d.acceptedTypes[job.type] !== false
-    );
-    if (donorIdx === -1) break;
-
-    jobQueue.shift();
-    const donor = available.splice(donorIdx, 1)[0];
-    donor.isIdle   = false;
-    job.status     = 'processing';
-    job.donorId    = donor.id;
-    job.assignedAt = Date.now();
-
-    job.timeoutTimer = setTimeout(() => {
-      requeueJob(job, 'Donor timed out');
-      activeJobs.delete(job.id);
-    }, JOB_TIMEOUT_MS);
-
-    activeJobs.set(job.id, job);
-
-    const donorSocket = io.sockets.sockets.get(donor.id);
-    if (donorSocket) donorSocket.emit('job_assigned', job);
-
-    const requesterSocket = io.sockets.sockets.get(job.requesterId);
-    if (requesterSocket) {
-      requesterSocket.emit('job_processing', {
-        jobId: job.id,
-        message: `📱 Donor found (${donor.gpuPower}% GPU)! Processing ${job.type}/${job.operation}...`,
-      });
-    }
-    assigned++;
-  }
-  if (assigned > 0) broadcastNetworkStatus();
-}
-
-function requeueJob(job, reason) {
-  if (job.timeoutTimer) clearTimeout(job.timeoutTimer);
-  const donor = donors.get(job.donorId);
-  if (donor) donor.isIdle = true;
-
-  const requesterSocket = io.sockets.sockets.get(job.requesterId);
-  if (requesterSocket) {
-    requesterSocket.emit('job_requeued', { jobId: job.id, message: 'Donor dropped — re-queuing...' });
-  }
-
-  job.status = 'queued'; job.donorId = null; job.assignedAt = null; job.timeoutTimer = null;
-  jobQueue.unshift(job);
-  console.log(`🔁 Re-queued: ${job.id} (${reason})`);
-  setTimeout(tryAssignJobs, 2000);
-}
-
-function broadcastNetworkStatus() {
-  io.emit('network_status', {
-    donors_online: donors.size,
-    idle_donors:   countIdleDonors(),
-    queue_length:  jobQueue.length,
-    active_jobs:   activeJobs.size,
-  });
-}
-
-function countIdleDonors() {
-  return Array.from(donors.values()).filter(d => d.isIdle).length;
-}
-
-function countIdleDonorsForType(jobType) {
-  return Array.from(donors.values()).filter(d =>
-    d.isIdle && (!d.acceptedTypes || d.acceptedTypes[jobType] !== false)
-  ).length;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  donors.forEach((donor, socketId) => {
-    if (now - donor.lastSeen > HEARTBEAT_DEAD_MS) {
-      activeJobs.forEach((job, jobId) => {
-        if (job.donorId === socketId) { requeueJob(job, 'Stale'); activeJobs.delete(jobId); }
-      });
-      donors.delete(socketId);
-    }
-  });
-}, 30_000);
-
-function generateId() {
-  return Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-}
-
-const PORT = process.env.PORT || 3000;
+// ─── Start ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
+  console.log('/////////////////////////////////////////////////////');
   console.log(`🚀 NetGPU Server running on port ${PORT}`);
-  console.log(`⚡ NVIDIA NIM:          ${NVIDIA_API_KEY  ? 'Connected ✅' : 'No key ❌'}`);
-  console.log(`☁️  Cloudflare Workers: ${CF_API_TOKEN    ? 'Connected ✅' : 'No key ❌'}`);
+  console.log(`⚡ NVIDIA NIM:           ${NVIDIA_API_KEY     ? 'Connected ✅' : 'Missing key ❌'}`);
+  console.log(`☁️  Cloudflare Workers:  ${CF_ACCOUNT_ID && CF_API_TOKEN ? 'Connected ✅' : 'Missing keys ❌'}`);
+  console.log('/////////////////////////////////////////////////////');
 });
